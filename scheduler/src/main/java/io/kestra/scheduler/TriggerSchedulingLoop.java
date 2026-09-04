@@ -36,6 +36,8 @@ public class TriggerSchedulingLoop implements Runnable {
     private static final Logger LOG = LoggerFactory.getLogger(TriggerSchedulingLoop.class);
 
     private static final long SCHEDULE_INTERVAL_MILLIS = Duration.ofSeconds(1).toMillis();
+    // A loop overrunning its interval has already missed a scheduling slot, so only jitter is tolerated.
+    private static final long MAX_LOOP_PERIOD_MILLIS = SCHEDULE_INTERVAL_MILLIS + (SCHEDULE_INTERVAL_MILLIS / 10);
 
     private final int schedulingLoopId;
     private final TriggerScheduler triggerScheduler;
@@ -124,18 +126,29 @@ public class TriggerSchedulingLoop implements Runnable {
         Instant nextScheduleTime = clock.instant();
         // Use the monotonic clock to measure the loop period.
         long tick = System.nanoTime();
+        // The setup cost of the first iteration, of trigger initialization and of a pause is not a scheduling delay.
+        boolean skipPeriodCheck = true;
+        int processedEvents = 0;
+        int evaluatedTriggers = 0;
         try {
             while (running.get()) {
                 long start = System.nanoTime();
                 try {
                     long elapsed = (start - tick) / 1_000_000;
-                    if (elapsed > (SCHEDULE_INTERVAL_MILLIS + (SCHEDULE_INTERVAL_MILLIS / 10))) {
-                        // useful for debugging unexpected schedule delay
-                        LOG.warn("Thread starvation or too many triggers to evaluate (elapsed since previous loop {}ms)", elapsed);
-                    }
                     tick = start;
+                    if (!skipPeriodCheck && elapsed > MAX_LOOP_PERIOD_MILLIS) {
+                        // useful for debugging unexpected schedule delay
+                        LOG.warn(
+                            "Scheduling loop ran late: {}ms elapsed since the previous loop, which processed {} trigger event(s) and evaluated {} trigger(s).",
+                            elapsed,
+                            processedEvents,
+                            evaluatedTriggers
+                        );
+                    }
+                    processedEvents = 0;
+                    evaluatedTriggers = 0;
 
-                    waitIfPaused();
+                    skipPeriodCheck = waitIfPaused();
 
                     // Check if the loop was stopped while being paused
                     if (!running.get()) {
@@ -160,15 +173,23 @@ public class TriggerSchedulingLoop implements Runnable {
                     if (!initialized.get()) {
                         triggerScheduler.onStart(clock, now, assignments);
                         initialized.set(true);
+                        skipPeriodCheck = true;
                     }
 
                     // Process all received triggers events for current assignments.
-                    processTriggerEvents();
+                    processedEvents = processTriggerEvents();
 
                     // Check whether triggers should be scheduled
                     if (now.isAfter(nextScheduleTime) || now.equals(nextScheduleTime)) {
-                        triggerScheduler.onSchedule(clock, now, assignments);
+                        evaluatedTriggers = triggerScheduler.onSchedule(clock, now, assignments);
                         nextScheduleTime = nextScheduleTime.plusMillis(SCHEDULE_INTERVAL_MILLIS);
+                        if (!nextScheduleTime.isAfter(now)) {
+                            // Skip the slots already gone - each of them would otherwise fire an immediate
+                            // evaluation of the very same due triggers - while keeping the one-second grid,
+                            // so that a late iteration does not shift every later evaluation.
+                            long behindMillis = now.toEpochMilli() - nextScheduleTime.toEpochMilli();
+                            nextScheduleTime = nextScheduleTime.plusMillis(SCHEDULE_INTERVAL_MILLIS * (behindMillis / SCHEDULE_INTERVAL_MILLIS + 1));
+                        }
                     }
 
                     // Execute end-loop actions
@@ -263,9 +284,9 @@ public class TriggerSchedulingLoop implements Runnable {
         }
     }
 
-    private void waitIfPaused() throws InterruptedException {
+    private boolean waitIfPaused() throws InterruptedException {
         if (!paused.get()) {
-            return; // return immediately
+            return false; // return immediately
         }
         pauseLock.lock();
         try {
@@ -277,6 +298,7 @@ public class TriggerSchedulingLoop implements Runnable {
         } finally {
             pauseLock.unlock();
         }
+        return true;
     }
 
     /**

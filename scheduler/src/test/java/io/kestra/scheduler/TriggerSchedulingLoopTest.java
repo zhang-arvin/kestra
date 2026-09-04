@@ -1,9 +1,15 @@
 package io.kestra.scheduler;
 
 import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
+import java.time.ZoneId;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -11,6 +17,7 @@ import org.mockito.Mockito;
 
 import io.kestra.core.metrics.MetricRegistry;
 import io.kestra.core.scheduler.events.TriggerEvent;
+import io.kestra.core.utils.Await;
 
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.Meter;
@@ -107,6 +114,92 @@ class TriggerSchedulingLoopTest {
     }
 
     @Test
+    void shouldNotEvaluateOncePerMissedIntervalWhenAssignmentsArriveLate() throws Exception {
+        // GIVEN
+        AdjustableClock adjustableClock = new AdjustableClock(Instant.parse("2026-01-01T00:00:00Z"));
+        clock = adjustableClock;
+        AtomicInteger evaluations = new AtomicInteger();
+        TriggerSchedulingLoop loop = createLoop();
+        Mockito.when(triggerScheduler.onSchedule(any(), any(), any())).thenAnswer(invocation -> evaluations.incrementAndGet());
+
+        Thread thread = new Thread(loop);
+        thread.start();
+
+        try {
+            // WHEN
+            awaitFirstIteration(loop);
+            adjustableClock.advance(Duration.ofSeconds(5));
+            loop.setAssignments(Set.of(1));
+
+            // THEN
+            Await.until(() -> evaluations.get() > 0, Duration.ofMillis(10), Duration.ofSeconds(10));
+            Thread.sleep(200); // leave room for any catch-up iteration to fire
+            assertThat(evaluations.get()).isEqualTo(1);
+        } finally {
+            loop.stop();
+            thread.join();
+        }
+    }
+
+    @Test
+    void shouldKeepScheduleGridWhenPreviousIterationRanLate() throws Exception {
+        // GIVEN
+        AdjustableClock adjustableClock = new AdjustableClock(Instant.parse("2026-01-01T00:00:00Z"));
+        clock = adjustableClock;
+        AtomicInteger evaluations = new AtomicInteger();
+        TriggerSchedulingLoop loop = createLoop();
+        Mockito.when(triggerScheduler.onSchedule(any(), any(), any())).thenAnswer(invocation -> evaluations.incrementAndGet());
+
+        Thread thread = new Thread(loop);
+        thread.start();
+
+        try {
+            // WHEN
+            awaitFirstIteration(loop);
+            adjustableClock.advance(Duration.ofMillis(5_400));
+            loop.setAssignments(Set.of(1));
+            Await.until(() -> evaluations.get() == 1, Duration.ofMillis(10), Duration.ofSeconds(10));
+
+            // THEN
+            adjustableClock.advance(Duration.ofMillis(600));
+            Await.until(() -> evaluations.get() == 2, Duration.ofMillis(10), Duration.ofSeconds(10));
+        } finally {
+            loop.stop();
+            thread.join();
+        }
+    }
+
+    @Test
+    void shouldNotEvaluateTwiceWhenWakingExactlyOneIntervalLate() throws Exception {
+        // GIVEN
+        AdjustableClock adjustableClock = new AdjustableClock(Instant.parse("2026-01-01T00:00:00Z"));
+        clock = adjustableClock;
+        AtomicInteger evaluations = new AtomicInteger();
+        TriggerSchedulingLoop loop = createLoop();
+        Mockito.when(triggerScheduler.onSchedule(any(), any(), any())).thenAnswer(invocation -> evaluations.incrementAndGet());
+
+        Thread thread = new Thread(loop);
+        thread.start();
+
+        try {
+            // WHEN
+            awaitFirstIteration(loop);
+            loop.setAssignments(Set.of(1));
+            Await.until(() -> evaluations.get() >= 1, Duration.ofMillis(10), Duration.ofSeconds(10));
+            // The slot is now one interval ahead, so the next iteration lands exactly on it plus one interval.
+            adjustableClock.advance(Duration.ofSeconds(2));
+
+            // THEN
+            Await.until(() -> evaluations.get() >= 2, Duration.ofMillis(10), Duration.ofSeconds(10));
+            Thread.sleep(200); // leave room for any catch-up iteration to fire
+            assertThat(evaluations.get()).isEqualTo(2);
+        } finally {
+            loop.stop();
+            thread.join();
+        }
+    }
+
+    @Test
     void shouldStopLoopGracefullyGivenRunningLoop() throws InterruptedException {
         // GIVEN
         TriggerSchedulingLoop loop = createLoop();
@@ -167,5 +260,41 @@ class TriggerSchedulingLoopTest {
 
         // THEN
         assertThat(processed).isEqualTo(0);
+    }
+
+    /**
+     * Waits for the loop to complete one iteration, so that it has read its initial schedule time
+     * before the test moves the clock.
+     */
+    private static void awaitFirstIteration(TriggerSchedulingLoop loop) throws Exception {
+        loop.doOnEndLoop(() -> {}).get(10, TimeUnit.SECONDS);
+    }
+
+    private static final class AdjustableClock extends Clock {
+
+        private final AtomicReference<Instant> instant;
+
+        private AdjustableClock(Instant instant) {
+            this.instant = new AtomicReference<>(instant);
+        }
+
+        private void advance(Duration duration) {
+            instant.updateAndGet(current -> current.plus(duration));
+        }
+
+        @Override
+        public ZoneId getZone() {
+            return ZoneId.of("UTC");
+        }
+
+        @Override
+        public Clock withZone(ZoneId zone) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public Instant instant() {
+            return instant.get();
+        }
     }
 }
